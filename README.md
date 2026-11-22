@@ -1,141 +1,103 @@
 # nvcodec-container-fix
 
+**Make NVDEC/NVENC work again in containers that get only some of the host's NVIDIA GPUs, with one `LD_PRELOAD`.**
+
+[![License: MIT](https://img.shields.io/github/license/Lixsp11/nvcodec-container-fix)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Lixsp11/nvcodec-container-fix)](https://github.com/Lixsp11/nvcodec-container-fix/releases/latest)
+![Platform: Linux x86-64](https://img.shields.io/badge/platform-Linux%20x86--64-informational)
+
 English | [简体中文](README.zh-CN.md)
 
-An `LD_PRELOAD` library that makes NVDEC/NVENC work in containers that are given only some of the host's GPUs.
-
-## Problem
-
-Since NVIDIA driver 570 (still present in 595), when a container has only some of the host's `/dev/nvidiaN` devices,
-the driver's GPU list queries still return all of the host's GPUs. On initialization, `libnvcuvid` (NVDEC) and
-`libnvidia-encode` (NVENC) open the "primary" GPU, the one with the lowest UUID in that list. If that GPU is not in the
-container, they fail. CUDA compute is not affected.
-
-### Symptoms
+Does ffmpeg (or any other NVDEC/NVENC program) fail like this inside a Docker or Kubernetes container on NVIDIA driver
+570 or newer?
 
 ```
 cuvidGetDecoderCaps(&caps) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected
 OpenEncodeSessionEx failed: unsupported device (2): (no details)
 ```
 
-See [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249) and
-[k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282), and
-[Status upstream](#status-upstream) below.
+If the container holds only some of the host's GPUs, this is most likely a known driver bug (CUDA itself keeps
+working). Preload this library and NVDEC/NVENC work again: no driver patch, no system changes. Verified on driver
+595.71.05, see [Tested](#tested).
 
-## How it works
-
-The library intercepts `ioctl`. After the driver returns a GPU list on `/dev/nvidiactl` (RM controls
-`GET_ATTACHED_IDS` 0x201, `GET_PROBED_IDS` 0x214 and `GET_ACTIVE_DEVICE_IDS` 0x288, sent directly or wrapped in
-`NV_ESC_IOCTL_XFER_CMD`), it removes the GPUs that are certainly not in the container. Once the list holds only the
-container's GPUs, the primary GPU is always one the container can open. Every GPU that is in the container is kept.
-
-To decide which GPUs are in the container, the library asks the driver for each GPU's device minor with
-`NV_ESC_CARD_INFO` on the same file descriptor. The driver reports each GPU under the same id that it puts in the
-lists, so no /proc entry is needed. This matters because in legacy mode libnvidia-container hides the other GPUs'
-`/proc/driver/nvidia/gpus` entries. A GPU is in the container if `/dev/nvidia{minor}` is the matching character
-device (195:minor), and certainly not in it if that node is missing or is something else. For an id that CARD_INFO
-does not list, or if CARD_INFO fails, the library falls back to the PCI address encoded in the id and the Device Minor
-in `/proc/driver/nvidia/gpus/<PCI>/information`.
-
-GPUs whose membership cannot be determined are kept. A list passes through unchanged unless at least one of the host's
-GPUs is known to be in the container and at least one is known not to be (so bare metal, whole-machine containers and
-CPU-only machines are untouched), and when filtering would leave it empty. So the library can be preloaded globally.
-The hook uses only raw system calls and stack buffers, preserves `errno` and depends only on GLIBC_2.17 symbols. See
-the header of `nvcodec_container_fix.c` for details.
-
-## Build
-
-Needs x86-64 Linux, gcc, make, binutils (`objdump`) and glibc 2.35 or newer headers (for `struct dl_find_object`). The
-built library needs only GLIBC_2.17, so it also loads into processes of older images.
+## Quick start
 
 ```bash
-make        # builds libnvcodec_container_fix.so and checks that it needs no glibc symbol newer than GLIBC_2.17
-make test   # unit tests with a mocked driver, /proc and /dev; no GPU needed
+curl -fLO https://github.com/Lixsp11/nvcodec-container-fix/releases/latest/download/libnvcodec_container_fix.so
+curl -fLO https://github.com/Lixsp11/nvcodec-container-fix/releases/latest/download/libnvcodec_container_fix.so.sha256
+sha256sum -c libnvcodec_container_fix.so.sha256
+
+LD_PRELOAD=$PWD/libnvcodec_container_fix.so ffmpeg -hwaccel cuda -i input.mp4 -c:v h264_nvenc output.mp4
 ```
 
-## Usage
+### Docker
+
+Put the library on the host, for example in `/opt/nvcodec-container-fix/`, mount it and preload it:
 
 ```bash
-LD_PRELOAD=/path/to/libnvcodec_container_fix.so <command>
+docker run --gpus '"device=1"' \
+  -v /opt/nvcodec-container-fix:/opt/nvcodec-container-fix:ro \
+  -e LD_PRELOAD=/opt/nvcodec-container-fix/libnvcodec_container_fix.so \
+  your-image ffmpeg -hwaccel cuda -i input.mp4 -c:v h264_nvenc output.mp4
 ```
 
-### Global preload
+### Kubernetes
 
-To load it in every login shell, add this to `~/.bash_profile`:
+With the library at `/opt/nvcodec-container-fix/` on every GPU node (or built into the image):
 
-```bash
-export LD_PRELOAD=/path/to/libnvcodec_container_fix.so
+```yaml
+spec:
+  containers:
+    - name: app
+      image: your-image
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      env:
+        - name: LD_PRELOAD
+          value: /opt/nvcodec-container-fix/libnvcodec_container_fix.so
+      volumeMounts:
+        - name: nvcodec-container-fix
+          mountPath: /opt/nvcodec-container-fix
+          readOnly: true
+  volumes:
+    - name: nvcodec-container-fix
+      hostPath:
+        path: /opt/nvcodec-container-fix
+        type: Directory
 ```
 
-`ssh host 'command'` and `tmux new-session 'command'` do not read `~/.bash_profile`; set `LD_PRELOAD` in the command
-explicitly. An image that sets its own `LD_PRELOAD` overrides the one from `~/.bash_profile`. To cover every process,
-write the library's absolute path to `/etc/ld.so.preload` instead (write it again after the container restarts):
+Docker `--gpus`, the default nvidia-container-runtime and the GPU Operator's envvar strategy run in
+libnvidia-container's legacy mode. That mode is handled by design but has not been run on hardware yet (see
+[Tested](#tested)); reports are welcome. To preload into every process, including ones started without the variable,
+see [Global preload](#global-preload).
 
-```bash
-echo /path/to/libnvcodec_container_fix.so >> /etc/ld.so.preload
-```
+## Why it happens
 
-### Environment variables
+- Since driver 570 (still present in 595), the driver's GPU list queries return **all** of the host's GPUs, even in a
+  container that has only some of the `/dev/nvidiaN` devices.
+- On initialization, `libnvcuvid` (NVDEC) and `libnvidia-encode` (NVENC) open the "primary" GPU, the one with the lowest
+  UUID in that list. If that GPU is not in the container, they fail. CUDA compute is not affected.
+- NVIDIA issues: [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249),
+  [k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282),
+  [open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826). No official fix is
+  confirmed yet, see [Upstream status](#upstream-status).
 
-- `NVCODEC_CONTAINER_FIX_DEBUG=1`: print every rewrite to stderr
-- `NVCODEC_CONTAINER_FIX_DISABLE=1`: pass everything through unchanged
+## Why this one
 
-## Testing on a GPU machine
+- **Drop-in:** one small `.so` that needs only GLIBC_2.17, so it also loads in old images. It patches no driver and
+  changes no files or system settings.
+- **Safe to preload everywhere:** it removes only GPUs that are certainly not in the container, and keeps anything it
+  cannot decide. Bare metal, whole-machine containers and CPU-only machines pass through untouched.
+- **Asks the driver, not /proc:** membership comes from `NV_ESC_CARD_INFO` plus a check of the 195:minor device node,
+  so it does not rely on /proc listing the hidden GPUs.
+- **Complete coverage:** it filters `GET_ATTACHED_IDS`, `GET_PROBED_IDS` (with its flags) and `GET_ACTIVE_DEVICE_IDS`
+  (MIG entries kept), sent directly or wrapped in `NV_ESC_IOCTL_XFER_CMD`, for every library in the process, so CUDA,
+  NVML and the codec libraries see the same GPU list.
+- **Tested:** unit tests that need no GPU, plus a GPU test script that compares runs with and without the library.
 
-```bash
-bash tests/run_tests.sh
-FFMPEG=/opt/ffmpeg/bin/ffmpeg PYTHON=/usr/bin/python3 bash tests/run_tests.sh   # other binaries
-```
-
-The script runs the same checks without the library as a baseline, then with it preloaded, and prints the exit code and
-last output lines of each: CUDA (`tests/test_cuda.py`), `nvidia-smi`, and for each GPU ffmpeg NVDEC (`hevc_cuvid`,
-`-hwaccel cuda`) and NVENC (`h264_nvenc`, `hevc_nvenc`). Finally it prints the library's debug log for one decode and
-one encode. The baseline is informational; the script exits non-zero if any check fails with the library preloaded. It
-needs:
-
-- `nvidia-smi`
-- `PYTHON` (default `python3`): Python 3; `tests/test_cuda.py` uses only the standard library (`ctypes`) and the
-  driver's `libcuda.so.1`
-- `FFMPEG` (default `ffmpeg`): an ffmpeg build with NVDEC/NVENC support (`hevc_cuvid`, `-hwaccel cuda`, `h264_nvenc`,
-  `hevc_nvenc`). The HEVC test clip is generated from ffmpeg's `testsrc` and encoded with `libx265` if that ffmpeg has
-  it, otherwise with `hevc_nvenc` with the library preloaded.
-
-## Verified environment
-
-This version, with `tests/run_tests.sh`, on hosts with 8 RTX 4090s, driver 595.71.05, in containers whose
-`/proc/driver/nvidia/gpus` lists all of the host's GPUs (as in CDI mode):
-
-- **The bug, fixed:** a container holding 2 of the 8 GPUs, with the device node of the host's primary GPU (the one
-  with the lowest UUID) made unavailable inside the container, leaving one GPU that is not the primary. Without the
-  library, `hevc_cuvid`, `h264_nvenc` and `hevc_nvenc` failed and `-hwaccel cuda` reported `CUDA_ERROR_NO_DEVICE` and
-  fell back to software decoding; with it, all of them worked. CUDA and `nvidia-smi` worked either way.
-- **No regression:** containers holding 1 and 2 of the 8 GPUs, including the primary GPU (where the bug does not
-  show): every check passed with and without the library; in the 2-GPU container, both GPUs decoded and encoded with
-  the library preloaded.
-- In every run the debug log showed the lists from libcuda (0x201, 0x214, 0x288) and libnvcuvid (0x201) filtered down
-  to the container's GPUs, with membership from CARD_INFO.
-
-An earlier version, which found minors through /proc only, has been used for long real-world decoding runs on 8 or
-more single-GPU containers of the same kind.
-
-- **By design, not yet run on hardware:** legacy mode (`docker --gpus`, the default nvidia-container-runtime, the GPU
-  Operator's envvar strategy), where libnvidia-container
-  ([`mount_procfs`, `mount_procfs_gpu`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349))
-  mounts a tmpfs over `/proc/driver/nvidia` and binds back only the container's GPUs. Membership then comes from
-  CARD_INFO.
-- **Untested:** containers holding several GPUs none of which is the primary; drivers other than 595.71.05.
-
-## Limitations
-
-- A 32-bit process that loads this 64-bit library prints a `wrong ELF class` warning (it keeps running).
-- x86-64 only: the source pins `dlsym` to `GLIBC_2.2.5`, the x86-64 base symbol version.
-- The library depends on the layout of the driver structs listed in the source header (the same in 570.86.15,
-  580.65.06, 595.71.05 and 620.73.04). After a major driver upgrade, run `make test` and `tests/run_tests.sh` first.
-- Membership is decided by the `/dev/nvidia{minor}` node. A device cgroup that denies an existing node is not seen.
-- Preloading does not reach statically linked programs, and the `LD_PRELOAD` variable is ignored for setuid programs
-  (`/etc/ld.so.preload` is not).
-
-## Comparison with similar projects
+<details>
+<summary><b>Comparison with similar projects</b></summary>
 
 | Project | Layer / delivery | Commands filtered | XFER | Membership decided by | Unknown ids | License |
 |---|---|---|---|---|---|---|
@@ -168,7 +130,91 @@ Where others are ahead:
 - The anlamm kernel fork works inside the driver, so it also covers statically linked programs and processes started
   without the preload.
 
-## Status upstream
+</details>
+
+## Tested
+
+With `tests/run_tests.sh`, on hosts with 8 RTX 4090s and driver 595.71.05, in containers whose
+`/proc/driver/nvidia/gpus` lists all of the host's GPUs (as in CDI mode):
+
+| Setup | Status | Result |
+|---|---|---|
+| 2 of 8 GPUs, the host's primary GPU (lowest UUID) made unavailable inside the container, leaving one GPU that is not the primary | **Fixed** | Without the library, `hevc_cuvid`, `h264_nvenc` and `hevc_nvenc` failed and `-hwaccel cuda` reported `CUDA_ERROR_NO_DEVICE` and fell back to software decoding. With it, all of them worked. CUDA and `nvidia-smi` worked either way |
+| 1 and 2 of 8 GPUs, including the primary (the bug does not show) | **No regression** | Every check passed with and without the library; in the 2-GPU container, both GPUs decoded and encoded with the library preloaded |
+| Debug log of every run above | **Confirmed** | The lists from libcuda (0x201, 0x214, 0x288) and libnvcuvid (0x201) were filtered down to the container's GPUs, with membership from CARD_INFO |
+| Earlier version (minors from /proc only), 8 or more single-GPU containers of the same kind | **Used** | Long real-world decoding runs |
+| Legacy mode: `docker --gpus`, the default nvidia-container-runtime, the GPU Operator's envvar strategy | **By design, not yet run on hardware** | libnvidia-container ([`mount_procfs`, `mount_procfs_gpu`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349)) mounts a tmpfs over `/proc/driver/nvidia` and binds back only the container's GPUs; membership then comes from CARD_INFO |
+| Several GPUs, none of them the primary; drivers other than 595.71.05 | **Untested** | |
+
+Tried it somewhere else? Please [open an issue](https://github.com/Lixsp11/nvcodec-container-fix/issues) with your
+driver version, container runtime and the output of `bash tests/run_tests.sh`. Successes help as much as failures.
+
+## Global preload
+
+To load it in every login shell, add this to `~/.bash_profile`:
+
+```bash
+export LD_PRELOAD=/path/to/libnvcodec_container_fix.so
+```
+
+`ssh host 'command'` and `tmux new-session 'command'` do not read `~/.bash_profile`; set `LD_PRELOAD` in the command
+explicitly. An image that sets its own `LD_PRELOAD` overrides the one from `~/.bash_profile`. To cover every process,
+write the library's absolute path to `/etc/ld.so.preload` instead (write it again after the container restarts):
+
+```bash
+echo /path/to/libnvcodec_container_fix.so >> /etc/ld.so.preload
+```
+
+## Environment variables
+
+- `NVCODEC_CONTAINER_FIX_DEBUG=1`: print every rewrite to stderr
+- `NVCODEC_CONTAINER_FIX_DISABLE=1`: pass everything through unchanged
+
+## Build from source
+
+Needs x86-64 Linux, gcc, make, binutils (`objdump`) and glibc 2.35 or newer headers (for `struct dl_find_object`). The
+built library needs only GLIBC_2.17, so it also loads into processes of older images.
+
+```bash
+make        # builds libnvcodec_container_fix.so and checks that it needs no glibc symbol newer than GLIBC_2.17
+make test   # unit tests with a mocked driver, /proc and /dev; no GPU needed
+```
+
+On a GPU machine, `tests/run_tests.sh` runs the same checks without the library as a baseline, then with it preloaded:
+
+```bash
+bash tests/run_tests.sh
+FFMPEG=/opt/ffmpeg/bin/ffmpeg PYTHON=/usr/bin/python3 bash tests/run_tests.sh   # other binaries
+```
+
+<details>
+<summary>What the GPU test checks and needs</summary>
+
+For each check the script prints the exit code and the last output lines: CUDA (`tests/test_cuda.py`), `nvidia-smi`,
+and for each GPU ffmpeg NVDEC (`hevc_cuvid`, `-hwaccel cuda`) and NVENC (`h264_nvenc`, `hevc_nvenc`). Finally it prints
+the library's debug log for one decode and one encode. The baseline is informational; the script exits non-zero if any
+check fails with the library preloaded. It needs:
+
+- `nvidia-smi`
+- `PYTHON` (default `python3`): Python 3; `tests/test_cuda.py` uses only the standard library (`ctypes`) and the
+  driver's `libcuda.so.1`
+- `FFMPEG` (default `ffmpeg`): an ffmpeg build with NVDEC/NVENC support (`hevc_cuvid`, `-hwaccel cuda`, `h264_nvenc`,
+  `hevc_nvenc`). The HEVC test clip is generated from ffmpeg's `testsrc` and encoded with `libx265` if that ffmpeg has
+  it, otherwise with `hevc_nvenc` with the library preloaded.
+
+</details>
+
+## Limitations
+
+- A 32-bit process that loads this 64-bit library prints a `wrong ELF class` warning (it keeps running).
+- x86-64 only: the source pins `dlsym` to `GLIBC_2.2.5`, the x86-64 base symbol version.
+- The library depends on the layout of the driver structs listed in the source header (the same in 570.86.15,
+  580.65.06, 595.71.05 and 620.73.04). After a major driver upgrade, run `make test` and `tests/run_tests.sh` first.
+- Membership is decided by the `/dev/nvidia{minor}` node. A device cgroup that denies an existing node is not seen.
+- Preloading does not reach statically linked programs, and the `LD_PRELOAD` variable is ignored for setuid programs
+  (`/etc/ld.so.preload` is not).
+
+## Upstream status
 
 No official fix is confirmed. In [k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)
 (2026-06-08), an NVIDIA maintainer wrote that "610.x versions seem to have the fix" but had not tested it. Users report
@@ -180,19 +226,32 @@ and [#13](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one
 [#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209) was closed as its duplicate.
 [open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826) is open.
 
-## License
+## How it works
 
-MIT, see [LICENSE](LICENSE). Struct layouts and constants come from NVIDIA's
-[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules/tree/595.71.05) 595.71.05 (dual MIT/GPL).
-They are interoperability facts; no code is copied.
+<details>
+<summary>Membership, CARD_INFO and the pass-through rules</summary>
 
-## References
+The library intercepts `ioctl`. After the driver returns a GPU list on `/dev/nvidiactl` (RM controls
+`GET_ATTACHED_IDS` 0x201, `GET_PROBED_IDS` 0x214 and `GET_ACTIVE_DEVICE_IDS` 0x288, sent directly or wrapped in
+`NV_ESC_IOCTL_XFER_CMD`), it removes the GPUs that are certainly not in the container. Once the list holds only the
+container's GPUs, the primary GPU is always one the container can open. Every GPU that is in the container is kept.
 
-- [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249),
-  [#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209),
-  [k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282),
-  [open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826),
-  [NVIDIA forum thread](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361)
+To decide which GPUs are in the container, the library asks the driver for each GPU's device minor with
+`NV_ESC_CARD_INFO` on the same file descriptor. The driver reports each GPU under the same id that it puts in the
+lists, so no /proc entry is needed. This matters because in legacy mode libnvidia-container hides the other GPUs'
+`/proc/driver/nvidia/gpus` entries. A GPU is in the container if `/dev/nvidia{minor}` is the matching character
+device (195:minor), and certainly not in it if that node is missing or is something else. For an id that CARD_INFO
+does not list, or if CARD_INFO fails, the library falls back to the PCI address encoded in the id and the Device Minor
+in `/proc/driver/nvidia/gpus/<PCI>/information`.
+
+GPUs whose membership cannot be determined are kept. A list passes through unchanged unless at least one of the host's
+GPUs is known to be in the container and at least one is known not to be (so bare metal, whole-machine containers and
+CPU-only machines are untouched), and when filtering would leave it empty. So the library can be preloaded globally.
+The hook uses only raw system calls and stack buffers, preserves `errno` and depends only on GLIBC_2.17 symbols. See
+the header of `nvcodec_container_fix.c` for details.
+
+References:
+
 - NVIDIA open-gpu-kernel-modules 595.71.05:
   [`nv_ioctl_card_info_t`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/common/inc/nv-ioctl.h#L56-L68),
   [`nvidia_read_card_info`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/nvidia/nv.c#L2359-L2405),
@@ -200,3 +259,16 @@ They are interoperability facts; no code is copied.
   [ids in the RM lists](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/src/nvidia/src/kernel/gpu_mgr/gpu_mgr.c#L2258),
   `nvos.h` (`NVOS54_PARAMETERS`), `gpu.c` (`gpuGenerate32BitId`)
 - [libnvidia-container `nvc_mount.c`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349-L458)
+- Issues: [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249),
+  [#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209),
+  [k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282),
+  [open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826),
+  [NVIDIA forum thread](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361)
+
+</details>
+
+## License
+
+MIT, see [LICENSE](LICENSE). Struct layouts and constants come from NVIDIA's
+[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules/tree/595.71.05) 595.71.05 (dual MIT/GPL).
+They are interoperability facts; no code is copied.

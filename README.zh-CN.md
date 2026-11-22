@@ -1,99 +1,87 @@
 # nvcodec-container-fix
 
+**容器只分到宿主机部分 NVIDIA GPU 时，一个 `LD_PRELOAD` 让 NVDEC/NVENC 重新能用。**
+
+[![License: MIT](https://img.shields.io/github/license/Lixsp11/nvcodec-container-fix)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Lixsp11/nvcodec-container-fix)](https://github.com/Lixsp11/nvcodec-container-fix/releases/latest)
+![Platform: Linux x86-64](https://img.shields.io/badge/platform-Linux%20x86--64-informational)
+
 [English](README.md) | 简体中文
 
-让只分到宿主机部分 GPU 的容器里 NVDEC/NVENC 能用的 `LD_PRELOAD` 库。
-
-## 问题
-
-NVIDIA 驱动 570 起（595 仍在）：容器只挂了宿主机部分 `/dev/nvidiaN` 时，驱动的 GPU 列表查询仍返回宿主机全部 GPU。`libnvcuvid`（NVDEC）、`libnvidia-encode`（NVENC）初始化时要打开列表里 UUID 最小的那张"主卡"，它不在容器里就失败。CUDA 计算不受影响。
-
-### 症状
+在 NVIDIA 驱动 570 及以上的 Docker 或 Kubernetes 容器里，ffmpeg（或别的用 NVDEC/NVENC 的程序）是不是这样报错？
 
 ```
 cuvidGetDecoderCaps(&caps) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected
 OpenEncodeSessionEx failed: unsupported device (2): (no details)
 ```
 
-见 [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249)、[k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)，以及下文的[上游现状](#上游现状)。
+如果容器只分到宿主机的部分 GPU，多半就是这个已知的驱动 bug（CUDA 本身照常能用）。preload 这个库，NVDEC/NVENC 就能用了：不打驱动补丁，不改系统。在驱动 595.71.05 上验证过，见[测试情况](#测试情况)。
 
-## 做法
-
-拦截 `ioctl`，驱动在 `/dev/nvidiactl` 上返回 GPU 列表（RM 控制 `GET_ATTACHED_IDS` 0x201、`GET_PROBED_IDS` 0x214、`GET_ACTIVE_DEVICE_IDS` 0x288，直接发的或套在 `NV_ESC_IOCTL_XFER_CMD` 里的）后，去掉确定不在容器里的 GPU。列表里只剩容器里的卡后，主卡总是容器能打开的那张。容器里的卡都会保留。
-
-判断哪些卡在容器里时，在同一个文件描述符上用 `NV_ESC_CARD_INFO` 向驱动要每张卡的设备次号。驱动给每张卡的 id 和它放进列表里的 id 相同，所以不需要 /proc。这一点要紧，因为 legacy 模式下 libnvidia-container 会把其他卡在 `/proc/driver/nvidia/gpus` 里的条目藏起来。`/dev/nvidia{minor}` 是对应的字符设备（195:minor）才算在容器里，这个节点不存在或是别的东西才算确定不在。CARD_INFO 里没有的 id，或 CARD_INFO 失败时，退回到按 id 里编码的 PCI 地址去对 `/proc/driver/nvidia/gpus/<PCI>/information` 的 Device Minor。
-
-判断不了的卡保留。宿主机里至少一张卡确定在容器里、至少一张确定不在时才改写，否则原样放行（裸机、整机容器、CPU 机器都不动）；过滤后为空时也原样放行。所以可以全局加载。钩子里只用裸系统调用和栈上缓冲区，保留 `errno`，只依赖 GLIBC_2.17 的符号。细节见 `nvcodec_container_fix.c` 文件头。
-
-## 编译
-
-需要 x86-64 Linux、gcc、make、binutils（`objdump`）和 glibc 2.35 及以上的头文件（用到 `struct dl_find_object`）。编出的库只依赖 GLIBC_2.17，preload 进旧镜像的进程也能加载。
+## 快速开始
 
 ```bash
-make        # 编出 libnvcodec_container_fix.so，并检查依赖的 glibc 符号版本不超过 GLIBC_2.17
-make test   # 模拟驱动、/proc 和 /dev 的单元测试，不需要 GPU
+curl -fLO https://github.com/Lixsp11/nvcodec-container-fix/releases/latest/download/libnvcodec_container_fix.so
+curl -fLO https://github.com/Lixsp11/nvcodec-container-fix/releases/latest/download/libnvcodec_container_fix.so.sha256
+sha256sum -c libnvcodec_container_fix.so.sha256
+
+LD_PRELOAD=$PWD/libnvcodec_container_fix.so ffmpeg -hwaccel cuda -i input.mp4 -c:v h264_nvenc output.mp4
 ```
 
-## 用法
+### Docker
+
+把库放到宿主机上，比如 `/opt/nvcodec-container-fix/`，挂进容器并 preload：
 
 ```bash
-LD_PRELOAD=/path/to/libnvcodec_container_fix.so <命令>
+docker run --gpus '"device=1"' \
+  -v /opt/nvcodec-container-fix:/opt/nvcodec-container-fix:ro \
+  -e LD_PRELOAD=/opt/nvcodec-container-fix/libnvcodec_container_fix.so \
+  your-image ffmpeg -hwaccel cuda -i input.mp4 -c:v h264_nvenc output.mp4
 ```
 
-### 全局加载
+### Kubernetes
 
-每个登录 shell 都加载：在 `~/.bash_profile` 里加
+每个 GPU 节点的 `/opt/nvcodec-container-fix/` 下放好库（或直接打进镜像）：
 
-```bash
-export LD_PRELOAD=/path/to/libnvcodec_container_fix.so
+```yaml
+spec:
+  containers:
+    - name: app
+      image: your-image
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      env:
+        - name: LD_PRELOAD
+          value: /opt/nvcodec-container-fix/libnvcodec_container_fix.so
+      volumeMounts:
+        - name: nvcodec-container-fix
+          mountPath: /opt/nvcodec-container-fix
+          readOnly: true
+  volumes:
+    - name: nvcodec-container-fix
+      hostPath:
+        path: /opt/nvcodec-container-fix
+        type: Directory
 ```
 
-`ssh 主机 '命令'`、`tmux new-session '命令'` 不读 `~/.bash_profile`，要在命令里显式带上 `LD_PRELOAD`。镜像自己设 `LD_PRELOAD` 会把 `~/.bash_profile` 里的覆盖；要对所有进程生效，改把库的绝对路径写进 `/etc/ld.so.preload`（容器重启后要重写）：
+Docker `--gpus`、默认的 nvidia-container-runtime 和 GPU Operator 的 envvar 策略走的是 libnvidia-container 的 legacy 模式。这个模式按设计能处理，但还没在硬件上跑过（见[测试情况](#测试情况)），欢迎反馈。要让所有进程（包括没带这个环境变量启动的）都加载，见[全局加载](#全局加载)。
 
-```bash
-echo /path/to/libnvcodec_container_fix.so >> /etc/ld.so.preload
-```
+## 为什么会这样
 
-### 环境变量
+- 驱动 570 起（595 仍在），驱动的 GPU 列表查询返回宿主机的**全部** GPU，哪怕容器只挂了部分 `/dev/nvidiaN`。
+- `libnvcuvid`（NVDEC）、`libnvidia-encode`（NVENC）初始化时要打开列表里 UUID 最小的那张"主卡"，它不在容器里就失败。CUDA 计算不受影响。
+- NVIDIA 的 issue：[nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249)、[k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)、[open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826)。还没有确认的官方修复，见[上游现状](#上游现状)。
 
-- `NVCODEC_CONTAINER_FIX_DEBUG=1`：每次改写打到 stderr
-- `NVCODEC_CONTAINER_FIX_DISABLE=1`：原样放行
+## 为什么选它
 
-## 在 GPU 机器上测试
+- **即插即用：** 一个很小的 `.so`，只依赖 GLIBC_2.17，旧镜像里也能加载；不打驱动补丁，不改任何文件和系统配置。
+- **可以放心全局加载：** 只去掉确定不在容器里的卡，判断不了的都保留；裸机、整机容器、CPU 机器原样放行。
+- **问驱动，不靠 /proc：** 卡在不在容器里由 `NV_ESC_CARD_INFO` 加 195:minor 设备节点判断，不依赖 /proc 列出被藏起来的卡。
+- **覆盖完整：** 过滤 `GET_ATTACHED_IDS`、`GET_PROBED_IDS`（连同 flags）和 `GET_ACTIVE_DEVICE_IDS`（MIG 条目保留），直接发的和套在 `NV_ESC_IOCTL_XFER_CMD` 里的都处理，进程里所有库发的都处理，CUDA、NVML 和编解码库看到的是同一份 GPU 列表。
+- **有测试：** 不需要 GPU 的单元测试，加上一个对比加载与不加载的 GPU 测试脚本。
 
-```bash
-bash tests/run_tests.sh
-FFMPEG=/opt/ffmpeg/bin/ffmpeg PYTHON=/usr/bin/python3 bash tests/run_tests.sh   # 换用别的程序
-```
-
-同一组测试先不加载库跑一遍作对照，再加载跑一遍，每项打印退出码和输出的最后几行：CUDA（`tests/test_cuda.py`）、`nvidia-smi`，以及每张卡上的 ffmpeg NVDEC（`hevc_cuvid`、`-hwaccel cuda`）和 NVENC（`h264_nvenc`、`hevc_nvenc`）。最后打印一次解码、一次编码时库的调试日志。对照组只作参考；加载库后有任何一项失败，脚本以非零退出。需要：
-
-- `nvidia-smi`
-- `PYTHON`（默认 `python3`）：Python 3；`tests/test_cuda.py` 只用标准库（`ctypes`）和驱动的 `libcuda.so.1`
-- `FFMPEG`（默认 `ffmpeg`）：支持 NVDEC/NVENC 的 ffmpeg（`hevc_cuvid`、`-hwaccel cuda`、`h264_nvenc`、`hevc_nvenc`）。HEVC 测试视频由 ffmpeg 的 `testsrc` 生成，这个 ffmpeg 有 `libx265` 时用它编码，否则加载本库用 `hevc_nvenc` 编码。
-
-## 已验证
-
-当前版本用 `tests/run_tests.sh` 测过。环境：宿主机有 8 张 RTX 4090，驱动 595.71.05，容器里的 `/proc/driver/nvidia/gpus` 列出宿主机全部 GPU（和 CDI 模式一样）。
-
-- **bug 复现并修好：** 容器分到 8 张里的 2 张，在容器里让宿主机主卡（UUID 最小的那张）的设备节点不可用，只剩一张不是主卡的卡。不加载时 `hevc_cuvid`、`h264_nvenc`、`hevc_nvenc` 失败，`-hwaccel cuda` 报 `CUDA_ERROR_NO_DEVICE` 并退回软件解码；加载后全部正常。CUDA 和 `nvidia-smi` 加不加载都正常。
-- **没有副作用：** 分到 8 张里 1 张和 2 张、且包含主卡的容器（这时 bug 不出现），加载和不加载都全部通过；2 卡容器里加载后两张卡都能解码、编码。
-- 每次运行的调试日志都显示，libcuda（0x201、0x214、0x288）和 libnvcuvid（0x201）拿到的列表被过滤成只剩容器里的卡，卡在不在容器里由 CARD_INFO 判断。
-
-只用 /proc 找次号的早先版本，在 8 个以上同样的单卡容器里长时间跑过实际的解码任务。
-
-- **按设计能处理，还没在硬件上跑过：** legacy 模式（`docker --gpus`、默认的 nvidia-container-runtime、GPU Operator 的 envvar 策略）。这时 libnvidia-container（[`mount_procfs`、`mount_procfs_gpu`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349)）在 `/proc/driver/nvidia` 上挂一层 tmpfs，只把容器自己的卡绑回去，容器里的卡由 CARD_INFO 判断。
-- **没测过：** 分到多张卡、但都不是主卡的容器；595.71.05 以外的驱动。
-
-## 局限
-
-- 32 位进程加载这个 64 位库会打 `wrong ELF class` 警告（不影响运行）。
-- 只支持 x86-64：源码把 `dlsym` 固定到 x86-64 的基础符号版本 `GLIBC_2.2.5`。
-- 依赖源码文件头列出的驱动结构体布局（570.86.15、580.65.06、595.71.05、620.73.04 相同），换大版本驱动后先跑 `make test` 和 `tests/run_tests.sh`。
-- 是否在容器里由 `/dev/nvidia{minor}` 节点判断，设备 cgroup 拒绝访问一个存在的节点时看不出来。
-- preload 管不到静态链接的程序；setuid 程序会忽略 `LD_PRELOAD` 环境变量（`/etc/ld.so.preload` 不受影响）。
-
-## 与同类项目的比较
+<details>
+<summary><b>与同类项目的比较</b></summary>
 
 | 项目 | 层次 / 加载方式 | 过滤的命令 | XFER | 怎么判断在不在容器里 | 判断不了的 id | 许可证 |
 |---|---|---|---|---|---|---|
@@ -119,16 +107,100 @@ FFMPEG=/opt/ffmpeg/bin/ffmpeg PYTHON=/usr/bin/python3 bash tests/run_tests.sh   
 - fenrir 通过 NRI 自动注入 Kubernetes 的 GPU 容器，用只读的 `/etc/ld.so.preload`（镜像自己的 `LD_PRELOAD` 盖不掉），并为 32 位进程准备了 i686 桩。
 - anlamm 的内核分支在驱动里生效，静态链接的程序和没带 preload 启动的进程也管得到。
 
+</details>
+
+## 测试情况
+
+用 `tests/run_tests.sh` 测过。环境：宿主机有 8 张 RTX 4090，驱动 595.71.05，容器里的 `/proc/driver/nvidia/gpus` 列出宿主机全部 GPU（和 CDI 模式一样）。
+
+| 场景 | 状态 | 结果 |
+|---|---|---|
+| 分到 8 张里的 2 张，在容器里让宿主机主卡（UUID 最小的那张）的设备节点不可用，只剩一张不是主卡的卡 | **修好** | 不加载时 `hevc_cuvid`、`h264_nvenc`、`hevc_nvenc` 失败，`-hwaccel cuda` 报 `CUDA_ERROR_NO_DEVICE` 并退回软件解码；加载后全部正常。CUDA 和 `nvidia-smi` 加不加载都正常 |
+| 分到 8 张里 1 张和 2 张、且包含主卡（这时 bug 不出现） | **没有副作用** | 加载和不加载都全部通过；2 卡容器里加载后两张卡都能解码、编码 |
+| 以上每次运行的调试日志 | **已确认** | libcuda（0x201、0x214、0x288）和 libnvcuvid（0x201）拿到的列表被过滤成只剩容器里的卡，卡在不在容器里由 CARD_INFO 判断 |
+| 早先版本（只用 /proc 找次号），8 个以上同样的单卡容器 | **用过** | 长时间跑过实际的解码任务 |
+| legacy 模式：`docker --gpus`、默认的 nvidia-container-runtime、GPU Operator 的 envvar 策略 | **按设计能处理，还没在硬件上跑过** | libnvidia-container（[`mount_procfs`、`mount_procfs_gpu`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349)）在 `/proc/driver/nvidia` 上挂一层 tmpfs，只把容器自己的卡绑回去；这时由 CARD_INFO 判断 |
+| 分到多张卡、但都不是主卡；595.71.05 以外的驱动 | **没测过** | |
+
+在别的环境里试过？欢迎[提 issue](https://github.com/Lixsp11/nvcodec-container-fix/issues)，附上驱动版本、容器运行时和 `bash tests/run_tests.sh` 的输出。成功和失败的报告都有用。
+
+## 全局加载
+
+每个登录 shell 都加载：在 `~/.bash_profile` 里加
+
+```bash
+export LD_PRELOAD=/path/to/libnvcodec_container_fix.so
+```
+
+`ssh 主机 '命令'`、`tmux new-session '命令'` 不读 `~/.bash_profile`，要在命令里显式带上 `LD_PRELOAD`。镜像自己设 `LD_PRELOAD` 会把 `~/.bash_profile` 里的覆盖；要对所有进程生效，改把库的绝对路径写进 `/etc/ld.so.preload`（容器重启后要重写）：
+
+```bash
+echo /path/to/libnvcodec_container_fix.so >> /etc/ld.so.preload
+```
+
+## 环境变量
+
+- `NVCODEC_CONTAINER_FIX_DEBUG=1`：每次改写打到 stderr
+- `NVCODEC_CONTAINER_FIX_DISABLE=1`：原样放行
+
+## 从源码编译
+
+需要 x86-64 Linux、gcc、make、binutils（`objdump`）和 glibc 2.35 及以上的头文件（用到 `struct dl_find_object`）。编出的库只依赖 GLIBC_2.17，preload 进旧镜像的进程也能加载。
+
+```bash
+make        # 编出 libnvcodec_container_fix.so，并检查依赖的 glibc 符号版本不超过 GLIBC_2.17
+make test   # 模拟驱动、/proc 和 /dev 的单元测试，不需要 GPU
+```
+
+在 GPU 机器上，`tests/run_tests.sh` 把同一组测试先不加载库跑一遍作对照，再加载跑一遍：
+
+```bash
+bash tests/run_tests.sh
+FFMPEG=/opt/ffmpeg/bin/ffmpeg PYTHON=/usr/bin/python3 bash tests/run_tests.sh   # 换用别的程序
+```
+
+<details>
+<summary>GPU 测试查什么、需要什么</summary>
+
+每项打印退出码和输出的最后几行：CUDA（`tests/test_cuda.py`）、`nvidia-smi`，以及每张卡上的 ffmpeg NVDEC（`hevc_cuvid`、`-hwaccel cuda`）和 NVENC（`h264_nvenc`、`hevc_nvenc`）。最后打印一次解码、一次编码时库的调试日志。对照组只作参考；加载库后有任何一项失败，脚本以非零退出。需要：
+
+- `nvidia-smi`
+- `PYTHON`（默认 `python3`）：Python 3；`tests/test_cuda.py` 只用标准库（`ctypes`）和驱动的 `libcuda.so.1`
+- `FFMPEG`（默认 `ffmpeg`）：支持 NVDEC/NVENC 的 ffmpeg（`hevc_cuvid`、`-hwaccel cuda`、`h264_nvenc`、`hevc_nvenc`）。HEVC 测试视频由 ffmpeg 的 `testsrc` 生成，这个 ffmpeg 有 `libx265` 时用它编码，否则加载本库用 `hevc_nvenc` 编码。
+
+</details>
+
+## 局限
+
+- 32 位进程加载这个 64 位库会打 `wrong ELF class` 警告（不影响运行）。
+- 只支持 x86-64：源码把 `dlsym` 固定到 x86-64 的基础符号版本 `GLIBC_2.2.5`。
+- 依赖源码文件头列出的驱动结构体布局（570.86.15、580.65.06、595.71.05、620.73.04 相同），换大版本驱动后先跑 `make test` 和 `tests/run_tests.sh`。
+- 是否在容器里由 `/dev/nvidia{minor}` 节点判断，设备 cgroup 拒绝访问一个存在的节点时看不出来。
+- preload 管不到静态链接的程序；setuid 程序会忽略 `LD_PRELOAD` 环境变量（`/etc/ld.so.preload` 不受影响）。
+
 ## 上游现状
 
 没有确认的官方修复。NVIDIA 维护者在 [k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)（2026-06-08）里说 "610.x versions seem to have the fix"，但没测过。有用户报告 610.43.03 和 610.57.04 上 NVENC 仍然失败（论坛 [#11](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361/11)、[#13](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361/13)）。[nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249) 以 "a fix for this does not belong in NVIDIA Container Toolkit" 关闭，[#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209) 作为它的重复关闭。[open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826) 仍开着。
 
+## 原理
+
+<details>
+<summary>怎么判断卡在不在容器里、CARD_INFO、什么时候原样放行</summary>
+
+拦截 `ioctl`，驱动在 `/dev/nvidiactl` 上返回 GPU 列表（RM 控制 `GET_ATTACHED_IDS` 0x201、`GET_PROBED_IDS` 0x214、`GET_ACTIVE_DEVICE_IDS` 0x288，直接发的或套在 `NV_ESC_IOCTL_XFER_CMD` 里的）后，去掉确定不在容器里的 GPU。列表里只剩容器里的卡后，主卡总是容器能打开的那张。容器里的卡都会保留。
+
+判断哪些卡在容器里时，在同一个文件描述符上用 `NV_ESC_CARD_INFO` 向驱动要每张卡的设备次号。驱动给每张卡的 id 和它放进列表里的 id 相同，所以不需要 /proc。这一点要紧，因为 legacy 模式下 libnvidia-container 会把其他卡在 `/proc/driver/nvidia/gpus` 里的条目藏起来。`/dev/nvidia{minor}` 是对应的字符设备（195:minor）才算在容器里，这个节点不存在或是别的东西才算确定不在。CARD_INFO 里没有的 id，或 CARD_INFO 失败时，退回到按 id 里编码的 PCI 地址去对 `/proc/driver/nvidia/gpus/<PCI>/information` 的 Device Minor。
+
+判断不了的卡保留。宿主机里至少一张卡确定在容器里、至少一张确定不在时才改写，否则原样放行（裸机、整机容器、CPU 机器都不动）；过滤后为空时也原样放行。所以可以全局加载。钩子里只用裸系统调用和栈上缓冲区，保留 `errno`，只依赖 GLIBC_2.17 的符号。细节见 `nvcodec_container_fix.c` 文件头。
+
+参考：
+
+- NVIDIA open-gpu-kernel-modules 595.71.05：[`nv_ioctl_card_info_t`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/common/inc/nv-ioctl.h#L56-L68)、[`nvidia_read_card_info`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/nvidia/nv.c#L2359-L2405)、[`gpu_id` 的来源](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/src/nvidia/arch/nvalloc/unix/src/osinit.c#L1622-L1639)、[RM 列表里的 id](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/src/nvidia/src/kernel/gpu_mgr/gpu_mgr.c#L2258)、`nvos.h`（`NVOS54_PARAMETERS`）、`gpu.c`（`gpuGenerate32BitId`）
+- [libnvidia-container `nvc_mount.c`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349-L458)
+- issue：[nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249)、[#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209)、[k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)、[open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826)、[NVIDIA 论坛帖](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361)
+
+</details>
+
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。结构体布局和常量取自 NVIDIA [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules/tree/595.71.05) 595.71.05（MIT/GPL 双许可），属于互操作所需的事实，没有复制其代码。
-
-## 参考
-
-- [nvidia-container-toolkit#1249](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1249)、[#1209](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1209)、[k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)、[open-gpu-kernel-modules#826](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/826)、[NVIDIA 论坛帖](https://forums.developer.nvidia.com/t/nvenc-and-nvdec-work-on-only-one-gpu-with-multi-gpu-setups-with-nvidia-container-toolkit-in-driver-565/347361)
-- NVIDIA open-gpu-kernel-modules 595.71.05：[`nv_ioctl_card_info_t`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/common/inc/nv-ioctl.h#L56-L68)、[`nvidia_read_card_info`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/kernel-open/nvidia/nv.c#L2359-L2405)、[`gpu_id` 的来源](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/src/nvidia/arch/nvalloc/unix/src/osinit.c#L1622-L1639)、[RM 列表里的 id](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/595.71.05/src/nvidia/src/kernel/gpu_mgr/gpu_mgr.c#L2258)、`nvos.h`（`NVOS54_PARAMETERS`）、`gpu.c`（`gpuGenerate32BitId`）
-- [libnvidia-container `nvc_mount.c`](https://github.com/NVIDIA/libnvidia-container/blob/90cde8ad3e17aa93e6e065115026c2c9db3ae41a/src/nvc_mount.c#L349-L458)
